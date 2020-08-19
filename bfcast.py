@@ -7,8 +7,8 @@ if __name__ == '__main__':
     import os
     import numpy as np
     import pandas as pd
-    from capacity_planning.PyMC3.pmprophet.pymc_prophet.model import PyMCProphet
-    from capacity_planning.PyMC3.pmprophet.pymc_prophet import utilities as ut
+    from Bayes.Prophet.model import PyMCProphet
+    from Bayes.Prophet import utilities as ut
     import pickle
 
     # ########################################################################
@@ -17,18 +17,15 @@ if __name__ == '__main__':
     # ########################################################################
     # read data
     freq = 'D'                 # time series frequency
-    df = pd.read_csv('~/prophet_example.csv')
-    df['ds'] = pd.to_datetime(df['ds'].values)
-
-    # read data
-    df = pd.read_csv('~/prophet_example.csv')
+    df = pd.read_csv('~/data.csv')
     df['ds'] = pd.to_datetime(df['ds'].values)
 
     # holidays: must run up to or past fcast date
     # prepare holidays DF
     # a DF with cols holiday (holiday name) and ds (holiday dates)
     # windows around holiday must be in the holiday date for each holiday,
-    # eg if we want to mark the day before Christmas as a holiday, include 12/24 in the list of dates for the Christmas holiday DF
+    # eg if we want to mark the day before Christmas as a holiday,
+    # include 12/24 in the list of dates for the Christmas holiday DF
     playoffs = pd.DataFrame({
         'holiday': 'playoff',
         'ds': pd.to_datetime(['2008-01-13', '2009-01-03', '2010-01-16',

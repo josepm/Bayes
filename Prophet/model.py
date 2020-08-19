@@ -19,8 +19,8 @@ import pandas as pd
 import pymc3 as pm
 import theano.tensor as tt
 from collections import defaultdict
-from capacity_planning.PyMC3.pmprophet.pymc_prophet import plot as p_plt
-from capacity_planning.PyMC3.pmprophet.pymc_prophet import utilities as ut
+from Bayes.Prophet import plot as p_plt
+from Bayes.Prophet import utilities as ut
 
 
 class PyMCProphet(pm.Model):

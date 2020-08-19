@@ -11,8 +11,8 @@ import pandas as pd
 import pymc3 as pm
 import theano.tensor as tt
 from collections import defaultdict
-from capacity_planning.PyMC3.pmprophet.pymc_prophet import plot as p_plt
-from capacity_planning.PyMC3.pmprophet.pymc_prophet import utilities as ut
+from Bayes.Prophet import plot as p_plt
+from Bayes.Prophet import utilities as ut
 
 
 def set_times(data):
@@ -27,6 +27,7 @@ def stick_breaking(beta_):
     return beta_ * _remaining
 
 
+data = pd.read_csv('~/data.csv')
 cpf = data[['ds', 'y']].set_index('ds').resample('7D').sum().reset_index()
 _, _, _, _, cpf['t'] = set_times(cpf)  # add 't'
 g = np.gradient(cpf['y'].values)  # trend
@@ -237,9 +238,11 @@ with pm.Model() as m:
     cpt_smry = pm.summary(cpt_trace)
     pm.traceplot(cpt_trace)
 
-https://gist.github.com/junpenglao/f7098c8e0d6eadc61b3e1bc8525dd90d
+# ##################################################################################
+# generate data
+# https://gist.github.com/junpenglao/f7098c8e0d6eadc61b3e1bc8525dd90d
 t = 1000
-n_cpt = 3
+n_cpt = 1
 tbreak = np.sort(np.random.randint(100, 900, n_cpt + 1))
 theta = np.random.exponential(25, size=n_cpt + 1)
 theta_t = np.zeros(t)
@@ -252,9 +255,124 @@ theta_t[tbreak[n_cpt]:] = theta[n_cpt]
 print(str(n_cpt) + ' ' + str(tbreak[n_cpt]) + ' ' + str(t) + ' ' + str(theta[n_cpt]))
 y = np.random.poisson(theta_t)
 
+timesteps = range(t)
 _, ax = plt.subplots(1, 1, figsize=(15, 3))
 ax.plot(range(t), y)
 ax.plot(theta_t)
+
+
+def cgpt(y, mdl, idx):
+    timesteps = range(len(y))
+    exp_scale = y.mean()
+
+    with mdl:
+        # Exponential priors
+        lambda_1 = lambdas[idx]  # pm.Exponential('lambda_1', lam=1 / exp_scale)
+        lambda_2 = lambdas[idx + 1 ]  #pm.Exponential('lambda_2', lam=1 / exp_scale)
+
+        lambda_diff = pm.Deterministic('lambda_diff', lambda_2 - lambda_1)
+
+        # Change point
+        changepoint = pm.DiscreteUniform('changepoint', lower=0, upper=max(timesteps), testval=len(y) // 2)
+
+        # First distribution is strictly before the other
+        lamda_selected = tt.switch(timesteps < changepoint, lambda_1, lambda_2)
+
+        # Observations come from Poission distributions with one of the priors
+        obs = pm.Poisson('obs', mu=lamda_selected, observed=y)
+
+        # sample
+        samples = 1000
+        step_method = pm.NUTS(target_accept=0.90, max_treedepth=15)
+        cpt_trace = pm.sample(samples, chains=None, step=step_method, tune=1000)
+        cpt_smry = pm.summary(cpt_trace)
+        pm.traceplot(cpt_trace)
+        spp = pm.sample_posterior_predictive(cpt_trace, samples=samples * 2, progressbar=False,
+                                             var_names=['changepoint'])
+        return np.round(spp['changepoint'].mean(), 0)
+
+import theano
+y_step = 10
+samples = 1000
+max_y_shared = theano.shared(y_step)
+y_shared = theano.shared(y)
+print('max_y_shared: ', max_y_shared.eval())
+print('y_shared: ', y_shared.shape.eval())
+
+timesteps_shared = theano.shared(np.array(list(range(len(y)))))
+print('timesteps_shared: ', timesteps_shared.shape.eval())
+
+y_sub = y_shared[0:max_y_shared]
+t_sub = timesteps_shared[0:max_y_shared]
+exp_scale = y_sub.eval().mean()
+print('y_sub: ', y_sub.eval())
+print('t_sub: ', t_sub.eval())
+model = pm.Model()
+
+with model:
+    # Exponential priors
+    lambda_1 = pm.Exponential('lambda_1', lam=1/exp_scale)
+    lambda_2 = pm.Exponential('lambda_2', lam=1/exp_scale)
+
+    # Change point
+    changepoint = pm.DiscreteUniform('changepoint', lower=0, upper=max_y_shared, testval=max_y_shared // 2)
+
+    # First distribution is strictly before the other
+    lamda_selected = tt.switch(t_sub < changepoint, lambda_1, lambda_2)
+    lambda_diff = pm.Deterministic('lambda_diff', lambda_2 - lambda_1)
+
+    # Observations come from Poission distributions with one of the priors
+    obs = pm.Poisson('obs', mu=lamda_selected, observed=y_sub)
+
+    # step_method = pm.NUTS(target_accept=0.90, max_treedepth=15)
+    # cpt_trace = pm.sample(samples, chains=None, step=step_method, tune=1000)
+    # cpt_smry = pm.summary(cpt_trace)
+    # pm.traceplot(cpt_trace)
+
+# Initial sampling (burn-in)
+with model:
+    step_method = pm.NUTS(target_accept=0.90, max_treedepth=15)
+    step = pm.Metropolis()
+    trace = pm.sample(samples, step=step_method, tune=1000, random_seed=42, progressbar=True)
+
+lengths = range(y_step, len(y), y_step)
+traces = list()
+for l in lengths:
+    max_y_shared.set_value(l)
+    with model:
+        step_method = pm.NUTS(target_accept=0.90, max_treedepth=15)
+        trace = pm.sample(samples, step=step_method, progressbar=True, tune=1000)
+        traces.append(trace)
+        print(str(l) + ' ' + str(np.shape(trace)))
+
+        # Find first timestep where 0 is not in the 95% interval
+        lambda_diff_mean_trace = [t['lambda_diff'].mean() for t in traces]
+        lambda_diff_lb_trace = [np.percentile(t['lambda_diff'], 2.5) for t in traces]
+        lambda_diff_up_trace = [np.percentile(t['lambda_diff'], 97.5) for t in traces]
+
+        detected_changepoint = next(
+            l for l, lb, up in zip(lengths, lambda_diff_lb_trace, lambda_diff_up_trace) if not (lb <= 0 <= up))
+        print('Change detected at timestep {}. (real changepoint = {})'.format(detected_changepoint, real_changepoint))
+
+
+
+with pm.Model() as model:
+    # Exponential priors
+    lambda_1 = pm.Exponential('lambda_1', lam=1/exp_scale)
+    lambda_2 = pm.Exponential('lambda_2', lam=1/exp_scale)
+    lambda_3 = pm.Exponential('lambda_3', lam=1/exp_scale)
+
+    # Change point
+    changepoint_1 = pm.DiscreteUniform('changepoint_1', lower=min(timesteps), upper=max(timesteps), testval=t//2)
+    changepoint_2 = pm.DiscreteUniform('changepoint_2', lower=changepoint_1, upper=max(timesteps), testval=t//2)
+
+    # First distribution is strictly before the other
+    lamda_selected = tt.switch(timesteps <= changepoint_1, lambda_1, lambda_2)
+    lamda_selected = tt.switch(timesteps <= changepoint_2, lambda_1, lambda_2)
+
+    # Observations come from Poission distributions with one of the priors
+    obs = pm.Poisson('obs', mu=lamda_selected, observed=y)
+
 
 def logistic(L, x0, k=500, t_=np.linspace(0., 1., 1000)):
     return L / (1 + tt.exp(-k * (t_ - x0)))
