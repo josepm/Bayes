@@ -578,12 +578,6 @@ class PyMCProphet(pm.Model):
         """
         print('fit::adding growth model')
 
-        if self.growth is None:
-            raise Exception('_fit_growth(): only when growth not None')
-            # eps = 1.0e-8
-            # self.growth_prior_scale = eps        # scaled_y between 0 and 1
-            # self.changepoints_prior_scale = eps  # scaled_y between 0 and 1
-
         with self.my_model:
             ts = self.data['t'].values
             cpt = np.linspace(start=0, stop=self.changepoint_range * np.max(ts), num=self.n_changepoints + 1)[1:]
@@ -604,11 +598,8 @@ class PyMCProphet(pm.Model):
             setattr(self, 'm', pm.Normal('m', 0, self.offset_prior_scale, shape=1))     # self.m = pm.Normal('m', 0, self.offset_prior_scale)
             self.growth_components.append('m')
 
-            if self.growth is None:
-                trend = pm.Deterministic('trend', (self.k + tt.dot(A, self.delta)) * ts + self.m)
-            else:
-                gamma = -cpt * self.delta
-                trend = pm.Deterministic('trend', (self.k + tt.dot(A, self.delta)) * ts + (self.m + tt.dot(A, gamma)))
+            gamma = -cpt * self.delta
+            trend = pm.Deterministic('trend', (self.k + tt.dot(A, self.delta)) * ts + (self.m + tt.dot(A, gamma)))
             return trend
 
     def _fit_func(self, name, func_components):
