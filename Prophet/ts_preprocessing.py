@@ -1,7 +1,7 @@
 """
-change point detection
+extract trend, seasonality and level
+detect changepoints in trend
 based on https://github.com/peterroelants/notebooks/blob/master/probabilistic_programming/Changepoint%20detection.ipynb
-- level change detection
 """
 import multiprocessing as mp
 try:
@@ -24,26 +24,11 @@ from Utilities import sys_utils as s_ut
 from Bayes.Prophet import ts_generate as ts_gen
 
 
-def from_posterior(param, samples):
-    smin, smax = np.min(samples), np.max(samples)
-    width = smax - smin
-    x = np.linspace(smin, smax, 100)
-    y = stats.gaussian_kde(samples).pdf(x)
-
-    # what was never sampled should have a small probability but not 0,
-    # so we'll extend the domain and use linear approximation of density on it
-    # In some cases, y cannot be 0 (eg exponential, ...)
-    nz = np.nonzero(y)
-    x = np.concatenate([[x[0] - 3 * width], x[nz], [x[-1] + 3 * width]])
-    ymin = np.min(y[nz]) / 10.0
-    # print('++++++++++++++++++++ ' + param + ' pre0: ' + str(len(y)) + ' post0: ' + str(len(nz[0])))
-    # print(y)
-    y = np.concatenate(([ymin], y[nz], [ymin]))
-    # print(y)
-    return pm.Interpolated(param, x, y)
-
-
 def level_model(y_old, y_new):
+    # PyMC3 level changepoint model
+    # level is modeled by Poisson RVs
+    # y_old: older data points since the last changepoint
+    # y_new: last win(10) datapoints
     mean_new = y_new.mean() if len(y_new) > 0 else None
     mean_old = y_old.mean() if len(y_old) > 0 else mean_new
     y_ = np.concatenate((y_old, y_new))
@@ -58,6 +43,10 @@ def level_model(y_old, y_new):
 
 
 def trend_model(y_old, y_new):
+    # PyMC3 trend changepoint model
+    # trend is modeled by Normal RVs
+    # y_old: older data points since the last changepoint
+    # y_new: last win(10) datapoints
     g_new = np.gradient(y_new)                     # observed trend
     g_old = np.gradient(y_old) if len(y_old) > 1 else g_new
     mu_new = g_new.mean() if len(g_new) > 0 else None
@@ -82,6 +71,15 @@ def trend_model(y_old, y_new):
 
 
 def get_changepoints(y, t_step=10, t_last=None, win=None, samples=1000, verbose=False, ci=0.95, type_='level'):
+    # change point detector
+    # for each new point(s) sample the model and get the 95% ci. If 0 is not in the ci bounds, it is a change point
+    # y: time series
+    # t_step: number of points added at each iteration
+    # win: size of the new points considered
+    # samples: PyMC3 samples
+    # verbose: for printing
+    # ci: confidence interval for a change
+    # type_: level or trend
     if type_ == 'level':
         rate = 'lambda'
         if y.min() < 0.0:
@@ -146,6 +144,7 @@ def get_changepoints(y, t_step=10, t_last=None, win=None, samples=1000, verbose=
 
 
 def stl_decompose(ts_, period, additive=True):
+    # wrapper for the statsmodels function
     if additive is False:
         min_ = np.min(ts_)
         ts_ = np.log1p(ts_ - min_)
@@ -160,6 +159,10 @@ def stl_decompose(ts_, period, additive=True):
 
 
 def mstl_decompose(ts_, periods, additive=True):
+    # multi-period STL
+    # computes STL for each period in periods, builds an OLS from the single period STL decomposition and derives the trend, season and level from the OLS
+    # ts_: time series
+    # periods: list of periods in ts_
     if periods is None:
         periods = list(range(2, int(len(ts_) / 3)))
     periods = list(set(periods))
@@ -171,9 +174,8 @@ def mstl_decompose(ts_, periods, additive=True):
 
     df = pd.DataFrame(stl_dict)
     X = df.values
-    model = sm.OLS(ts, X)
-    results = model.fit()
-    stl_level = results.resid
+    results = sm.OLS(ts_, X).fit()
+    stl_level = results.resid   # by definition
     stl_season = np.sum(np.array([X[:, i] * results.params[i] for i in range(0, 2 * len(periods), 2)]), axis=0)
     stl_trend = np.sum(np.array([X[:, i] * results.params[i] for i in range(1, 2 * len(periods), 2)]), axis=0)
     print('periods: ' + str(periods) + ' resid mean: ' + str(np.mean(stl_level)) + ' resid std: ' + str(np.std(stl_level)))
@@ -181,6 +183,7 @@ def mstl_decompose(ts_, periods, additive=True):
 
 
 def plot_decompose(stl_season, stl_trend, stl_level, season, trend, level, title='STL Decomposition'):
+    # plot STL decompositions
     fig, axes = plt.subplots(nrows=3, ncols=1)
     t = len(stl_season)
     axes[0].plot(np.arange(t), trend, 'b-', np.arange(t), stl_trend, 'g-')
@@ -193,70 +196,3 @@ def plot_decompose(stl_season, stl_trend, stl_level, season, trend, level, title
     axes[2].legend(['level', 'STL_level'], frameon=False)
     axes[2].grid(True)
     fig.suptitle(title)
-
-
-##################################################################################
-##################################################################################
-##################################################################################
-##################################################################################
-
-# examples
-# level change
-t = 200
-n_cpt = 5
-y, tbreak, theta_t = ts_gen._change_data(t, 'level', n_cpt=n_cpt, noise_level=0.0, slow_bleed=0.0)
-
-t_step = 1
-cpts = get_changepoints(y, t_step=t_step, t_last=10, type_='level', verbose=True)
-print('level change actuals: ' + str(tbreak))
-print('level changes detected: ' + str(cpts))
-ts_gen.plot_change(y, np.array(range(t)), theta_t, cpts)
-
-# trend change
-t = 200
-n_cpt = 5
-y, tbreak, theta_t = ts_gen._change_data(t, 'trend', n_cpt=n_cpt, noise_level=0.0, slow_bleed=0.0)
-
-t_step = 1
-cpts = get_changepoints(y, t_step=t_step, t_last=10, type_='trend', verbose=True)
-print('trend change actuals: ' + str(tbreak))
-print('trend changes detected: ' + str(cpts))
-ts_gen.plot_change(y, np.array(range(t)), theta_t, cpts)
-
-t_step = 1
-cpts = get_changepoints(np.gradient(y), t_step=t_step, t_last=10, type_='level', verbose=True)
-print('trend change actuals: ' + str(tbreak))
-print('trend changes detected: ' + str(cpts))
-ts_gen.plot_change(y, np.array(range(t)), theta_t, cpts)
-
-# generate a TS with trend, seasonality and level changes (variance changes)
-# additive vs multiplicative????
-# assume seasonalities are known
-# extract trend and level (noise)
-# assume
-seasonalities_ = [('monthly', 365.25/12, 3), ('weekly', 7, 2)]
-period = min([s[1] for s in seasonalities_])
-t = 150
-additive = True
-ts, season, trend, level, trend_tbreak, level_tbreak, trend_thetat, level_thetat = ts_gen.change_data(t, seasonalities=seasonalities_,
-                                                                                               additive=additive, trend_cpt=3, level_cpt=2,
-                                                                                               noise_level=0.25, slow_bleed=0.05)
-
-
-stl_season, stl_trend, stl_level = mstl_decompose(ts, periods=None, additive=additive)
-plot_decompose(stl_season, stl_trend, stl_level, season, trend, level, title='All')
-
-
-print('\nStarting level change points ....')
-t_step = 1
-level_cpts = get_changepoints(stl_level, t_step=t_step, t_last=10, type_='level', verbose=True)
-print('level change actuals: ' + str(level_tbreak))
-print('level changes detected: ' + str(level_cpts))
-ts_gen.plot_change(level, np.array(range(t)), level_thetat, level_cpts)
-
-print('\nStarting trend change points ....')
-t_step = 1
-trend_cpts = get_changepoints(stl_trend, t_step=t_step, t_last=10, type_='trend', verbose=True)
-print('trend change actuals: ' + str(trend_tbreak))
-print('trend changes detected: ' + str(trend_cpts))
-ts_gen.plot_change(trend, np.array(range(t)), trend_thetat, trend_cpts)
