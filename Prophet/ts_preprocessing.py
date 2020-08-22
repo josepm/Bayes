@@ -1,7 +1,10 @@
 """
 extract trend, seasonality and level
+seasonalities are given
 detect changepoints in trend
 based on https://github.com/peterroelants/notebooks/blob/master/probabilistic_programming/Changepoint%20detection.ipynb
+TODO: add noise to the seasonality periods
+TODO: code clean up and refactor
 """
 import multiprocessing as mp
 try:
@@ -21,7 +24,6 @@ from statsmodels.tsa.seasonal import STL
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import acf
 from Utilities import sys_utils as s_ut
-from Bayes.Prophet import ts_generate as ts_gen
 
 
 def level_model(y_old, y_new):
@@ -95,7 +97,8 @@ def get_changepoints(y, t_step=10, t_last=None, win=None, samples=1000, verbose=
     if win is None:
         win = 10
     t_last = max(t_last, win)
-    changepoints, t_start = list(), 0
+    w_changepoints = list()
+    r_changepoints, t_start = list(), 0
     while t_last <= len(y):
         if len(y[t_start:t_last]) >= 2 * win:
             y_new, y_old = y[t_last - win:t_last], y[t_start:t_last - win]
@@ -120,8 +123,8 @@ def get_changepoints(y, t_step=10, t_last=None, win=None, samples=1000, verbose=
                 trace = pm.sample(samples, step=step_method, progressbar=True, tune=1000)
 
         alpha = (1.0 - ci) / 2.0
-        d_lwr = np.quantile(trace['diff'], alpha)
-        d_upr = np.quantile(trace['diff'], 1 - alpha)
+        r_lwr = np.quantile(trace['diff'], alpha)
+        r_upr = np.quantile(trace['diff'], 1 - alpha)
         w_lwr = np.quantile(trace['w'][:, 0], alpha) - 0.5
         w_upr = np.quantile(trace['w'][:, 0], 1 - alpha) - 0.5
         if verbose:
@@ -130,21 +133,29 @@ def get_changepoints(y, t_step=10, t_last=None, win=None, samples=1000, verbose=
             w = trace['w'][:, 0].mean()
             print('t_start: ' + str(t_start) + ' t_last: ' + str(t_last) +
                   ' w0: ' + str(np.round(w, 4)) + ' rate1: ' + str(np.round(v1, 4)) + ' rate2: ' + str(np.round(v2, 4)) +
-                  ' d_upr: ' + str(np.round(d_upr, 4)) + ' d_lwr: ' + str(np.round(d_lwr, 4)) +
+                  ' r_upr: ' + str(np.round(r_upr, 4)) + ' r_lwr: ' + str(np.round(r_lwr, 4)) +
                   ' w_upr: ' + str(np.round(w_upr, 4)) + ' w_lwr: ' + str(np.round(w_lwr, 4))
                   )
 
-        if d_lwr * d_upr > 0 or w_lwr * w_upr > 0:  # 0 is not included in [d_lwr, d_upr] with <ci> confidence or same for w and 0.5
+        # detect changepoint by rate change
+        if r_lwr * r_upr > 0:  # 0 is not included in [r_lwr, r_upr] with <ci> confidence
             if verbose:
-                print('\t\t============================================= Level changepoint detected at time: ' + str(t_last - 1) + ' with t_step: ' + str(t_step))
-            changepoints.append(t_last - 1)
+                print('\t\t============================================= ' + type_ + ' r_changepoint detected at time: ' + str(t_last - 1) + ' with t_step: ' + str(t_step))
+            r_changepoints.append(t_last - 1)
             t_start = t_last
+
+        # detect changepoint by mixture change
+        if w_lwr * w_upr > 0:  # 0.5 is not included in [w_lwr, w_upr] with <ci> confidence
+            if verbose:
+                print('\t\t============================================= ' + type_ + ' w_changepoint detected at time: ' + str(t_last - 1) + ' with t_step: ' + str(t_step))
+            w_changepoints.append(t_last - 1)
+
         t_last += t_step
-    return changepoints
+    return r_changepoints
 
 
 def stl_decompose(ts_, period, additive=True):
-    # wrapper for the statsmodels function
+    # wrapper for the statsmodels STL function
     if additive is False:
         min_ = np.min(ts_)
         ts_ = np.log1p(ts_ - min_)
@@ -163,8 +174,9 @@ def mstl_decompose(ts_, periods, additive=True):
     # computes STL for each period in periods, builds an OLS from the single period STL decomposition and derives the trend, season and level from the OLS
     # ts_: time series
     # periods: list of periods in ts_
-    if periods is None:
-        periods = list(range(2, int(len(ts_) / 3)))
+    if periods is None:  # usual periods
+        periods_ = [7, 365.25/12, 365, 365.25 / 3]  # assuming daily data
+        periods = [p for p in periods_ if p <= len(ts_) / 2]
     periods = list(set(periods))
     stl_dict = dict()
     for p in periods:
@@ -172,10 +184,10 @@ def mstl_decompose(ts_, periods, additive=True):
         stl_dict['season' + str(p)], stl_dict['trend' + str(p)], level_ = stl_decompose(ts_, period=int(p), additive=additive)
         print('period: ' + str(p) + ' resid mean: ' + str(np.mean(level_)) + ' resid std: ' + str(np.std(level_)))
 
-    df = pd.DataFrame(stl_dict)
+    df = pd.DataFrame(stl_dict)  # residuals are derived from the OLS
     X = df.values
     results = sm.OLS(ts_, X).fit()
-    stl_level = results.resid   # by definition
+    stl_level = results.resid   # residuals of the multi-STL fit
     stl_season = np.sum(np.array([X[:, i] * results.params[i] for i in range(0, 2 * len(periods), 2)]), axis=0)
     stl_trend = np.sum(np.array([X[:, i] * results.params[i] for i in range(1, 2 * len(periods), 2)]), axis=0)
     print('periods: ' + str(periods) + ' resid mean: ' + str(np.mean(stl_level)) + ' resid std: ' + str(np.std(stl_level)))
@@ -196,3 +208,21 @@ def plot_decompose(stl_season, stl_trend, stl_level, season, trend, level, title
     axes[2].legend(['level', 'STL_level'], frameon=False)
     axes[2].grid(True)
     fig.suptitle(title)
+
+
+def plot_change(t_, y_, thetat_, cpt_hat, cpt):
+    # y_: trend, level TS
+    # t_: time
+    # theta_t: parameter TS
+    # cpt: list of change points
+    _, ax = plt.subplots(1, 1, figsize=(15, 3))
+    ax.plot(t_, y_)
+    ax.grid(True)
+    ax2 = ax.twinx()
+    ax2.plot(thetat_, color='g')
+    for c in cpt:
+        ax2.axvline(c, color='k', lw=1, ls='dashed')
+    for c in cpt_hat:
+        ax2.axvline(c, color='r', lw=1, ls='dashed')
+    plt.show()
+
