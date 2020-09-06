@@ -3,7 +3,7 @@ see https://www.ritchievink.com/blog/2018/10/09/build-facebooks-prophet-in-pymc3
 see https://github.com/luke14free/pm-prophet
 see https://github.com/facebook/prophet/tree/1053a6e9ce935ff29c8f69f56d0a6b3c3397520e/python/fbprophet
 see https://docs.pymc.io/notebooks/dp_mix.html
-
+TODO: list found change points: find where self.m changes
 """
 
 from typing import List, Union

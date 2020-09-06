@@ -66,7 +66,7 @@ if __name__ == '__main__':
     ds_max = df['ds'].max()
     cutoff_date = ds_max - pd.to_timedelta(forecast_periods, unit=freq)
     df_in = df[df['ds'] >= '2014-01-01'].copy()  # fewer data points
-    growth = 'logistic'
+    growth = 'linear'
     floor, ceiling = None, None
     if growth == 'logistic':
         df_in['y'] = (df_in['y'] - df_in['y'].min()) / (df_in['y'].max() - df_in['y'].min())
@@ -120,9 +120,9 @@ if __name__ == '__main__':
     print('PyMC forecast performance::MAPE: ' + str(np.round(mape_err, 2)) + '% MASE: ' + str(np.round(mase_err, 2)))
 
     # save fcast object
-    fout = os.path.expanduser('~/my_data/fcast_obj.pkl')
-    with open(fout, 'wb') as fp:
-        pickle.dump(fcast_m, fp, pickle.HIGHEST_PROTOCOL)
+    # fout = os.path.expanduser('~/my_data/fcast_obj.pkl')
+    # with open(fout, 'wb') as fp:
+    #     pickle.dump(fcast_m, fp, pickle.HIGHEST_PROTOCOL)
 
     # read fcast obj
     # with open(fout, 'rb') as fp:
