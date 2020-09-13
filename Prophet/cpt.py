@@ -51,89 +51,32 @@ print('trend change actuals: ' + str(tbreak))
 print('trend changes detected: ' + str(cpts))
 ts_pre.plot_change(y, np.array(range(t)), theta_t, cpts)
 
-# generate a TS with trend, seasonality and level changes (variance changes)
-# additive vs multiplicative????
+# generate a TS with trend, seasonality and level changes (noise leve)
 # assume seasonalities are known
 # extract trend and level (noise)
 # find change points in trend
-seasonalities_ = [('monthly', 365.25/12, 3), ('weekly', 7, 2), ('yearly', 365.25, 5)]
+seasonalities_ = [('monthly', 365.25/12, 5), ('weekly', 7, 3), ('yearly', 365.25, 2)]
 periods = [s[1] for s in seasonalities_]
-t = 1024
+t = 1200
 trend_cpt = 3
 level_cpt = 0
-mix = 0.0
-if mix == 1.0:
-    mode = 'a'
-elif mix == 0.0:
-    mode = 'm'
-else:
-    print('!!!!!!!!!!!!!!!!!!!!!!!!!! ERROR: not implemented !!!!!!!!!!!!!!!!!!!!!!!!!')
-    mode = None
 
 # generate TS
-ts_obj = ts_gen.TimeSeries(t, seasonalities=seasonalities_, events=None, mix=mix, trend_cpt=trend_cpt, level_cpt=level_cpt,
+ts_obj = ts_gen.TimeSeries(t, seasonalities=seasonalities_, event=None, t_size=0, trend_cpt=trend_cpt, level_cpt=level_cpt,
                            trend_noise_level=0.0, trend_slow_bleed=0.0, level_noise_level=0.0, level_slow_bleed=0.0)
-stl_season, stl_trend, stl_level = ts_pre.mstl_decompose(ts_obj.ts, periods, mode)
+f_order = 20
+stl_season, stl_trend, stl_level, y = ts_pre.mstl_decompose(ts_obj.ts, periods, f_order=f_order)
+cpt_arr = ts_pre.qr_changepoint(stl_trend, window=10, alpha=0.05)
+print(ts_obj.trend_tbreak_)
 
-if mode.lower()[0] == 'a':
-    season = ts_obj.a_seasons
-    trend = ts_obj.a_trend
-    level = ts_obj.a_level
-else:
-    season = ts_obj.m_seasons
-    trend = ts_obj.m_trend
-    level = ts_obj.m_level
+df = ts_pre.pw_changepoint(stl_trend)
+df['cpt_in'] = [ts_obj.trend_tbreak_ for i in range(len(df))]
+print('exact: ' + str(ts_obj.trend_tbreak_) + ' f0: ' + str(f0))  # + ' f7: ' + str(f7))
 
-ts_pre.plot_decompose(stl_season, stl_trend, stl_level, season, trend, level, ts_obj.ts, title='All')
 
-# a_stl_season, a_stl_trend, a_stl_level = ts_pre._mstl_decompose(np.log(ts_obj.ts), periods, f_order=20)
-# ts_pre.plot_decompose(None, None, None, season, trend, level, ts_obj.ts, title='All-Mult')
-# ts_pre.plot_decompose(None, None, None, np.log(season), np.log(trend), np.log(level), np.log(ts_obj.ts), title='All-add')
-# ts_pre.plot_decompose(stl_season, stl_trend, stl_level, np.log(season), np.log(trend), np.log(level), np.log(ts_obj.ts), title='All-Mult')
 
-m_df = pd.DataFrame({'m_ts': ts_obj.ts, 'm_stl_trend': stl_trend, 'm_trend': ts_obj.m_trend})
-m_df.plot(grid=True)
-a_df = np.log(m_df)
-a_df.rename(columns={'m_ts': 'a_ts', 'm_stl_trend': 'a_stl_trend', 'm_trend': 'a_trend'}, inplace=True)
-a_df.plot(grid=True)
-
-aic_arr, rss_arr, pars_arr, bic_arr = list(), list(), list(), list()
-for f in np.linspace(0.1, 0.9, 9):
-    m_stl_trend = sm.nonparametric.lowess(m_stl_trend_, range(len(m_stl_trend_)), frac=f, return_sorted=False)
-    df = pd.DataFrame({'in': m_stl_trend_, 'out': m_stl_trend})
-    rss = np.sum((m_stl_trend - m_stl_trend_) ** 2)
-    nobs = len(m_stl_trend)
-    pars = 2 * nobs / f   # capture total overfit with f = 0 (y_loess = y) and f = 1, linear approx
-    aic = 2 * pars + nobs * np.log(rss)  # aic: 2, bic: log(n)
-    bic = np.log(nobs) * pars + nobs * np.log(rss / nobs)  # aic: 2, bic: log(n)
-    aic_arr.append(aic)
-    bic_arr.append(bic)
-    rss_arr.append(rss)
-    pars_arr.append(pars)
-    # df.plot(grid=True, title=str(f) + ':: err: ' + str(np.round(rss, 2)) + ' aic: ' + str(np.round(aic, 2)))
-xf = pd.DataFrame({'f': np.linspace(0.1, 0.9, 9), 'aic': aic_arr, 'bic': bic_arr, 'rss': rss_arr, 'pars': pars_arr})
-xf.set_index('f', inplace=True)
-xf[['aic', 'bic']].plot(grid=True)
-# xf[['rss']].plot(grid=True)
-
-a_stl_season, a_stl_trend, a_stl_level = ts_pre._mstl_decompose(np.log(ts_obj.ts), periods, f_order=f_order)
-m_stl_trend_ = np.exp(a_stl_trend)
-x = np.array(range(len(m_stl_trend_)))
-# loess.loess_bandwith(x, m_stl_trend_, iter_=3, fmin=0.1, fmax=0.9, npts=10)
-yhat = loess.opt_loess(x, m_stl_trend_, iter_=3, fmin=0.1, fmax=0.9, npts=10)
-xf = pd.DataFrame({'x': x, 'yhat': yhat, 'm_trend_': m_stl_trend_})
-xf.set_index('x', inplace=True)
-xf.plot(grid=True)
-
-get_bandwith(np.array(range(len(m_stl_trend_))), m_stl_trend_)
-m_stl_trend = sm.nonparametric.lowess(m_stl_trend_, range(len(m_stl_trend_)), frac=0.5, return_sorted=False)
-if np.min(m_stl_trend) < 0.0:
-    m_stl_trend += (1.0e-6 - np.min(m_stl_trend))
-a_stl_season, a_stl_level = ts_pre._mstl_sl(np.log(ts_obj.ts), np.log(m_stl_trend), periods, f_order)
-
-X_train = sf.values
-results = sm.OLS(y_train, X_train, missing='drop').fit()
-stl_season = results.predict(X_train)
+cpt_hat, lbda_arr = ts_pre.process_TS(ts_obj.ts, periods, f_order=20, t_step=1)
+ts_pre.plot_change(ts_obj.trend, np.array(range(t)), None, ts_obj.trend_tbreak_, cpt_hat)
 
 
 # trend changes
@@ -152,4 +95,3 @@ if level_cpt >= 0:
     print('level change actuals: ' + str(level_tbreak))
     print('level changes detected: ' + str(level_cpts))
     ts_pre.plot_change(np.array(range(t)), stl_level, level_thetat, level_cpts, level_tbreak)
-
