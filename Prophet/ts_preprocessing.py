@@ -15,7 +15,7 @@ Notes:
 
 changepoint detection solutions
 - tt_changepoint(): fast, simple, generates more changepoints than actuals in general. Accuracy OK
-- qr_changepoint(): fast, simple, generates more changepoints than actual in general. OK accuracy
+- qr_changepoint(): fast, simple, generates more changepoints than actual in general. Good accuracy  <<<<<<<<<<<<<
 - mcmc_changepoint: very slow, too many parameters but seems pretty accurate
 - cu_changepoint(): change point detection based on cusum. no generic way to set up threshold and drift. Not very accurate
 - rpt_changepoint(): change point detection based on ruptures. no generic way to set up penalty. Not very accurate
@@ -24,6 +24,7 @@ changepoint detection solutions
 
 TODO: detect data gaps and fill them before STL decomposition
 TODO: fill NaN with data_gaps() in pre_changepoint()
+TODO: how to set eps in qr_changepoint
 """
 import multiprocessing as mp
 try:
@@ -105,42 +106,53 @@ def fourier_series(n_pts, seasonality, do_beta=True):
         return x
 
 
-def rel_ext(acf_):
+def rel_ext(acf_, periods):
     # find relative extrema of the acf
     # the first non-empty array of extrema will contain the main period, if any
-    rel_idx, sz = list(), len(acf_)
-    while len(rel_idx) == 0 and sz > 0:
-        rel_idx = signal.argrelextrema(acf_, np.greater, order=sz)[0]
-        sz -= 1
-    print('extrema periods: ' + str(rel_idx))
-    return np.min(rel_idx) if len(rel_idx) > 0 else None
+    int_periods = [int(np.round(p, 0)) for p in periods]
+    sz = min(int_periods)
+
+    rel_idx = signal.argrelextrema(acf_, np.greater, order=sz)[0]
+    if len(rel_idx) > 0:
+        f_periods = [(q[0], q[1], np.abs(q[0] - q[1])) for q in itertools.product(int_periods, rel_idx)]
+        dmin, px = np.inf, max(int_periods)
+        for pi, pr, d in f_periods:
+            if d <= dmin and pi <= px:
+                dmin = d
+                px = pi
+    else:
+        px = None
+    print('px: ' + str(px) + ' extrema periods: ' + str(rel_idx))
+    return px if len(rel_idx) > 0 else None
 
 
-def pre_changepoint(ts_, do_plot=False):
+def pre_changepoint(ts_, periods, do_plot=False):
     # clean the trend diff() TS of remaining frequencies
     f = pd.DataFrame({'trend': ts_})
-    # f = pd.DataFrame({'trend': stl_trend})
 
     # remove noise from dtrend, which should be constant between level changes
     f['dtrend'] = f['trend'].diff()
     f['dtrend'].fillna(f.loc[1, 'dtrend'], inplace=True)
     acf_df = pd.DataFrame({'period': range(int(len(f) / 3))})
     acf_df['acf'] = acf_df['period'].apply(lambda x: f['dtrend'].autocorr(lag=int(x)))
-    period = rel_ext(acf_df['acf'].values)
-    print('main period: ' + str(period))
-    f['dtrend_diff'] = f['dtrend'].diff(period)
-    f['period'] = period
+    px = rel_ext(acf_df['acf'].values, periods)
+    print('main period: ' + str(px))
+    f['dtrend_diff'] = f['dtrend'].diff(px)
+    f['period'] = px
     f.dropna(inplace=True)  # but keep index, i.e. do not reset_index!!!!
 
-    # ewa re-intoduces lagged correlations! nice try!
+    acf_df = pd.DataFrame({'period': range(int(len(f) / 3))})
+    acf_df['dtrend_acf'] = acf_df['period'].apply(lambda x: f['dtrend'].autocorr(lag=int(x)))
+    acf_df['dtrend_diff_acf'] = acf_df['period'].apply(lambda x: f['dtrend_diff'].autocorr(lag=int(x)))
+    acf_df['trend_acf'] = acf_df['period'].apply(lambda x: f['trend'].autocorr(lag=int(x)))
+
+    # Note: ewa re-intoduces lagged correlations!
     # w = 0.05 if period is None else 1.0 / period
     # f['dtrend_dewa'] = f[['dtrend_diff']].ewm(alpha=w, adjust=False).mean()
-    acf_df = pd.DataFrame({'period': range(int(len(f) / 3))})
-    acf_df['acf'] = acf_df['period'].apply(lambda x: f['dtrend'].autocorr(lag=int(x)))
-    acf_df['diff_acf'] = acf_df['period'].apply(lambda x: f['dtrend_diff'].autocorr(lag=int(x)))
     # acf_df['acf_dewa'] = acf_df['period'].apply(lambda x: f['dtrend_dewa'].autocorr(lag=int(x)))
-    acf_df.set_index('period', inplace=True)
+
     if do_plot:
+        acf_df.set_index('period', inplace=True)
         acf_df.plot(grid=True, style='-+')
     return f
 
@@ -162,6 +174,118 @@ def to_additive(ts_):
             last_diff = diff
         ctr += 1
     return zf, best_ycol
+
+# ############################################################
+# ############ q-regression change detection #################
+# ############################################################
+
+
+def QR_fit(y, q=0.5):
+    # QR fit for dtrend: should be constant, i.e. no slope in dtrend
+    # dtrend model: y = slope
+    X = np.ones(len(y))
+    res = sm.QuantReg(y, X).fit(q)
+    slope = res.params[0]
+    resid = res.resid
+    std = np.std(resid)
+    mean = np.mean(resid)
+    print('std: ' + str(np.round(std, 4)) + ' mean: ' + str(np.round(mean, 4)))
+    return slope
+
+
+def qr_changepoint(f, window=25, alpha=0.01, a_cpts=None, do_plot=False, eps=0.1):
+    # changepoint detection based on quantile regression
+    # f: DF with trend data
+    # a_cpts: actual cpts
+    # window: window size for stats
+    # alpha: significance
+    # eps: tolerance on the QR
+    ts = f['dtrend_diff'].values
+    if f['period'].isnull().sum() == 0:
+        window = f.loc[f.index[0], 'period']
+
+    if do_plot:
+        ax = plt.figure().add_subplot(111)
+        f[['dtrend', 'dtrend_diff']].plot(grid=True, style='+-', ax=ax)
+    start0, ctr = 0, 0
+    end0 = start0 + window
+    shift, start1, end1, cpt_arr = 1, start0, end0, list()
+    yk0 = ts[start0:end0]
+    slope = QR_fit(yk0)
+    y_upr0 = np.sum(yk0 > slope)
+    while end1 <= len(ts):
+        start1 += shift
+        end1 += shift
+        yk1 = ts[start1:end1]
+        y_upr = np.sum(yk1 > slope)
+        pval_lwr = sps.binom_test(y_upr, window, 0.5 - eps, alternative='two-sided')
+        pval_upr = sps.binom_test(y_upr, window, 0.5 + eps, alternative='two-sided')
+        pval = max(pval_lwr, pval_upr)
+        if pval < alpha:
+            cpt_arr.append(end1)
+            print('end: ' + str(end1) + ' start: ' + str(start1) + ' pval: ' + str(np.round(pval, 4)) +
+                  '  init_ratio: ' + str(np.round(y_upr0 / window, 4)) + '  ratio: ' + str(np.round(y_upr / window, 4)))
+            if do_plot:
+                ax.axvline(end1, color='r')
+            ctr += 1
+            start0 = end1
+            end0 = start0 + window
+            yk0 = ts[start0:end0]
+            slope = QR_fit(yk0)
+            y_upr0 = np.sum(yk0 > slope)
+            start1 = start0
+            end1 = end0
+    if a_cpts is not None:
+        _ = [ax.axvline(cp, color='k') for cp in a_cpts]
+    print('cpts: ' + str(ctr))
+    return cpt_arr
+
+# ############################################################
+# ################ T-Test change detection #####################
+# ############################################################
+
+
+def tt_changepoint(f, window=25, alpha=0.01, a_cpts=None, do_plot=False):
+    # change point detection based on t-test
+    # f: DF with trend data
+    # a_cpts: actual cpts
+    # window: window size for stats
+    # alpha: significance
+
+    ts = f['dtrend_diff'].values
+    if f['period'].isnull().sum() == 0:
+        window = f.loc[f.index[0], 'period']
+
+    if do_plot:
+        ax = plt.figure().add_subplot(111)
+        f[['dtrend', 'dtrend_diff']].plot(grid=True, style='+-', ax=ax)
+    start0, ctr = 0, 0
+    end0 = start0 + window
+    shift, start1, end1, cpt_arr = 1, start0, end0, list()
+    while end1 <= len(ts):
+        yk0 = ts[start0:end0]
+        start1 += shift
+        end1 += shift
+        yk1 = ts[start1:end1]
+        yk = ts[start0:end1]
+        popmean = np.mean(yk0)
+        _, pval = sps.ttest_1samp(yk, popmean)  # compare the means
+        if pval < alpha:
+            cpt_arr.append(end1)
+            print('end: ' + str(end1) + ' start: ' + str(start1) + ' pval: ' + str(np.round(pval, 4)) +
+                  ' mean0: ' + str(np.round(np.mean(yk0), 4)) + ' mean1: ' + str(np.round(np.mean(yk1), 4)))
+            if do_plot:
+                ax.axvline(end1, color='r')
+            ctr += 1
+            start0 = end1
+            end0 = start0 + window
+            start1 = start0
+            end1 = end0
+    if a_cpts is not None:
+        _ = [ax.axvline(cp, color='k') for cp in a_cpts]
+    print('cpts: ' + str(ctr))
+    return cpt_arr
+
 
 # ############################################################
 # ################ MCMC change detection #####################
@@ -296,47 +420,6 @@ def mcmc_changepoint(y, t_step=10, t_last=None, win=None, samples=1000, verbose=
         t_last += t_step
     return changepoints
 
-
-# ############################################################
-# ################ T-Test change detection #####################
-# ############################################################
-
-
-def tt_changepoint(f, window=25, alpha=0.01, do_plot=False):
-    # change point detection based on t-test
-    # f, window = pre_changepoint(ts_, window=window)
-    # ycol = 'dtrend_diff'                # used to detect changes in trend
-    # ts = f[ycol].values
-    ts = f['dtrend_diff'].values
-    if f['period'].isnull().sum() == 0:
-        window = f.loc[f.index[0], 'period']
-
-    if do_plot:
-        ax = plt.figure().add_subplot(111)
-        f[['dtrend', 'dtrend_diff']].plot(grid=True, style='+-', ax=ax)
-    start0, ctr = 0, 0
-    end0 = start0 + window
-    shift, start1, end1, cpt_arr = 1, start0, end0, list()
-    while end1 <= len(ts):
-        yk0 = ts[start0:end0]
-        start1 += shift
-        end1 += shift
-        yk1 = ts[start1:end1]
-        _, pval = sps.ttest_ind(yk0, yk1)  # compare the means
-        if pval < alpha:
-            cpt_arr.append(end1)
-            print('end: ' + str(end1) + ' start: ' + str(start1) + ' pval: ' + str(np.round(pval, 4)) +
-                  ' mean0: ' + str(np.round(np.mean(yk0), 4)) + ' mean1: ' + str(np.round(np.mean(yk1), 4)))
-            if do_plot:
-                ax.axvline(end1, color='r')
-            ctr += 1
-            start0 = end1
-            end0 = start0 + window
-            start1 = start0
-            end1 = end0
-    print('cpts: ' + str(ctr))
-    return cpt_arr
-
 # ############################################################
 # ################ CUSUM change detection ####################
 # ############################################################
@@ -382,60 +465,6 @@ def rpt_changepoint(f, window=25):
         result = algo.predict(pen=p)
         print(str(p) + ' ' + str(result))
     return None
-
-# ############################################################
-# ############ q-regression change detection #################
-# ############################################################
-
-
-def QR_fit(y):
-    # QR fit for dtrend: should be constant, i.e. no slope in dtrend
-    X = np.ones(len(y))
-    res = sm.QuantReg(y, X).fit(0.5)
-    slope = res.params[0]
-    return slope
-
-
-def qr_changepoint(f, window=25, alpha=0.01, do_plot=False):
-    # changepoint detection based on quantile regression
-    # f, window = pre_changepoint(ts_, window=window)
-    # ycol = 'dtrend_diff'                # used to detect changes in trend
-    # ts = f[ycol].values
-    ts = f['dtrend_diff'].values
-    if f['period'].isnull().sum() == 0:
-        window = f.loc[f.index[0], 'period']
-
-    if do_plot:
-        ax = plt.figure().add_subplot(111)
-        f[['dtrend', 'dtrend_diff']].plot(grid=True, style='+-', ax=ax)
-    start0, ctr = 0, 0
-    end0 = start0 + window
-    shift, start1, end1, cpt_arr = 1, start0, end0, list()
-    yk0 = ts[start0:end0]
-    slope = QR_fit(yk0)
-    y_upr0 = np.sum(yk0 > slope)
-    while end1 <= len(ts):
-        start1 += shift
-        end1 += shift
-        yk1 = ts[start1:end1]
-        y_upr = np.sum(yk1 > slope)
-        pval = sps.binom_test(y_upr, window, 0.5, alternative='two-sided')
-        if pval < alpha:
-            cpt_arr.append(end1)
-            print('end: ' + str(end1) + ' start: ' + str(start1) + ' pval: ' + str(np.round(pval, 4)) +
-                  '  init_ratio: ' + str(np.round(y_upr0 / window, 4)) + '  ratio: ' + str(np.round(y_upr / window, 4)))
-            if do_plot:
-                ax.axvline(end1, color='r')
-            ctr += 1
-            start0 = end1
-            end0 = start0 + window
-            yk0 = ts[start0:end0]
-            slope = QR_fit(yk0)
-            y_upr0 = np.sum(yk0 > slope)
-            start1 = start0
-            end1 = end0
-    print('cpts: ' + str(ctr))
-    return cpt_arr
 
 # ############################################################
 # #################### pwlf change detection #################
@@ -492,17 +521,17 @@ def stl_decompose(ts_, period):
     return result.seasonal, result.trend, result.resid
 
 
-def mstl_decompose(ts_, periods, f_order=20):
+def mstl_decompose(ts_, periods, f_order=20, do_plot=False):
     # multi-period STL decomposition
     zf, ycol = to_additive(ts_)      # convert TS to an additive TS before the STL decomposition
-    stl_season, stl_level, f, season_cfg = _mstl_decompose(zf[ycol].values[:, None], periods, f_order=f_order)
+    stl_season, stl_level, f, season_cfg = _mstl_decompose(zf[ycol].values[:, None], periods, f_order=f_order, do_plot=do_plot)
 
     # return STL values of the aditve TS, the additve TS amd the list of YJ lambdas used to turn input TS to an additve TS
     stl_trend = f['dtrend_diff'].values
     return stl_season, stl_trend, stl_level, zf['y'].values, f, season_cfg
 
 
-def _mstl_decompose(ts_, periods, f_order=20):
+def _mstl_decompose(ts_, periods, f_order=20, do_plot=False):
     """
     multi-period STL decomposition:
     computes STL for each period in periods by building an OLS from the single period STL decompositions
@@ -519,9 +548,9 @@ def _mstl_decompose(ts_, periods, f_order=20):
     X = df.values
     results = sm.OLS(ts_, X).fit()
     stl_trend = results.predict(X)      # the trend fits well but some seasonality information leaks through.
-    f = pre_changepoint(stl_trend, do_plot=False)
+    f = pre_changepoint(stl_trend, periods, do_plot=do_plot)
     stl_trend = f['dtrend_diff']
-    sl_resi = ts_ - stl_trend   # results.resid
+    sl_resi = f['trend'] - stl_trend   # results.resid
     stl_season, stl_level, season_cfg = _mstl_sl(sl_resi, periods, f_order)
     return stl_season, stl_level, f, season_cfg
 
