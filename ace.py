@@ -5,6 +5,12 @@ Y dependent variable
 X independent variables
 Find theta() and phi_i() that maximize correlation between theta(Y) and sum_{i=1}^p phi_i(X_i) where theta(Y) = sum_{i=1}^p phi_i(X_i)
 
+set use to SuperSmoother or Lowess
+if supersoother fails, switch to lowess
+
+set method to 'loop' or 'bounded'
+lowess with method = 'loop' converges faster than with method 'bounded'
+
 use from my_projects.ace import ace
 """
 
@@ -15,6 +21,13 @@ import supersmoother as sm
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from scipy.interpolate import interp1d
+import statsmodels.api as sm_api
+from sklearn.model_selection import LeaveOneOut
+from joblib import Parallel, delayed
+from scipy.optimize import minimize_scalar
+import time
+
+lowess = sm_api.nonparametric.lowess
 
 N_JOBS = 4 if sys.platform == 'darwin' else os.cpu_count()
 
@@ -51,18 +64,99 @@ class ContSmooth(object):
      continuous smoother
      :param x: given values
      :param y: y values
+     :param use: 'SuperSmoother' or 'Lowess'
+     :param method: (Lowess only) 'loop' or 'bounded'
      :return: E[y|x=a]
      """
-    def __init__(self, x, y):
-        self.model = sm.SuperSmoother()
-        self.model.fit(x, y, dy=np.std(y))
+    def __init__(self, x, y, use='SuperSmoother', method='loop', verbose=False):
+        if use == 'SuperSmoother':
+            self.model = sm.SuperSmoother()
+            try:
+                self.model.fit(x, y, dy=np.std(y))
+            except ValueError as e:
+                if verbose:
+                    print('WARNING: ' + str(e) + '\nUsing Lowess smoother')
+                self.model = LowessSmooth(x, y, method)
+        elif use == 'Lowess':
+            self.model = LowessSmooth(x, y, method)
+        else:
+            print('ERROR: invalid smoother')
+            sys.exit(-1)
 
     def predict(self, xarr):
         return self.model.predict(xarr)
 
 
+class LowessSmooth(object):
+    def __init__(self, x, y, method):
+        # method: bounded or loop
+        tic = time.time()
+        frac_list_ = [0.0015625, 0.003125, 0.00625, 0.0125, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
+        self.min_frac = 3 / len(x)  # at least 3 points
+        self.frac_list = [f for f in frac_list_ if f > self.min_frac]
+        self.args = np.argsort(x)
+        self.xs = x[self.args]
+        self.ys = y[self.args]
+        self.delta = 0.01 * (self.xs[-1] - self.xs[0])
+        self.it = 3
+        if method is None:
+            method = 'loop'
+        self.bw, min_mse, niter = self.get_bw(method)
+        print('lowess fit:: method: ' + str(method) +
+              ' time: ' + str(np.round(time.time() - tic, 2)) + 'secs frac: ' + str(np.round(self.bw, 2)) + ' min_mse: ' + str(np.round(min_mse, 4)) + ' niter: ' + str(niter))
+
+        # prepare predict for Lowess
+        yhat = lowess(self.ys, self.xs, frac=self.bw, is_sorted=True, delta=self.delta, it=self.it)[:, 1]
+        self.fpred = interp1d(self.xs, yhat, fill_value='extrapolate', kind='linear')
+
+    def lowess_cv(self, frac):
+        loo = LeaveOneOut()
+        # sqr_errs = [self.loocv_idx(train_index, test_index, frac) for train_index, test_index in loo.split(self.xs)]
+        sqr_errs = Parallel(n_jobs=N_JOBS)(delayed(self.loocv_idx)(train_index, test_index, frac) for train_index, test_index in loo.split(self.xs))
+        mse = np.mean(np.array(sqr_errs))
+        return mse
+
+    def get_bw(self, method):
+        if method == 'loop':
+            return self._loop_bw()
+        elif method == 'bounded':
+            return self._bounded_bw()
+        else:
+            return self._loop_bw()
+
+    def _loop_bw(self):
+        # exit after max_quit_ctr values larger than min_mse
+        min_mse, bw, ix = np.inf, 0.5, 0
+        quit_ctr, max_quit_ctr = 0, 1
+        for ix, frac in enumerate(self.frac_list):
+            mse = self.lowess_cv(frac)
+            if mse < min_mse:
+                quit_ctr = 0  # reset quit_ctr
+                min_mse = mse
+                bw = frac
+            else:
+                quit_ctr += 1
+                if quit_ctr == max_quit_ctr:  # break after we see max_quit_ctr values with mse larger than min_mse
+                    break
+        return bw, min_mse, 2 + ix
+
+    def _bounded_bw(self):
+        res = minimize_scalar(self.lowess_cv, bracket=None, bounds=(self.min_frac, 0.99), method='bounded', options={'xatol': 1.0e-03, 'maxiter': 500})
+        return res.x, res.fun, res.nfev
+
+    def loocv_idx(self, train_index, test_index, frac):
+        xs_train, xs_test = self.xs[train_index], self.xs[test_index]
+        ys_train, ys_test = self.ys[train_index], self.ys[test_index]
+        yhat_i = lowess(ys_train, xs_train, frac=frac, is_sorted=True, delta=self.delta, it=self.it)[:, 1]
+        f = interp1d(xs_train, yhat_i, fill_value='extrapolate', kind='linear')
+        return (ys_test - f(xs_test)) ** 2
+
+    def predict(self, xval):
+        return self.fpred(xval)
+
+
 class ACE(object):
-    def __init__(self, X, y, cat_X=None, cat_y=False, verbose=True):
+    def __init__(self, X, y, use, method, cat_X=None, cat_y=False, verbose=True):
         """
         ACE class
         non-categorical: no repeat values (may need to add noise)
@@ -75,6 +169,7 @@ class ACE(object):
         :param y: (n, ) np.array, dependent variable
         :param cat_X: list of categorical features (column indices in X)
         :param cat_y: True if y is categorical else continuous
+        :param method: None, loop or bounded. None defaults to loop
         :param verbose: True to print
         """
         if self.check_data(X, 'X') is False:
@@ -84,8 +179,8 @@ class ACE(object):
         self.X_in = X                                                 # self.X shape: (nrows, ncols) (features in columns)
         self.x_scaler = StandardScaler()
         self.X = self.x_scaler.fit_transform(X)                       # self.X shape: (nrows, ncols) (features in columns)
-        self.y_in = np.reshape(y, (-1, 1))                            # self.y shape: (nrows, 1)
-        self.y = StandardScaler().fit_transform(self.y_in)            # self.y shape: (nrows, 1)
+        self.y_in = y                                                              # self.y shape: (nrows, 1)
+        self.y = StandardScaler().fit_transform(np.reshape(y, (-1, 1)))            # self.y shape: (nrows, 1)
         self.scaler = StandardScaler()
         self.theta = self.y
         self.phi = np.zeros_like(self.X)                              # initialize the phi functions
@@ -93,6 +188,8 @@ class ACE(object):
         self.cat_y = cat_y                                            # True/False
         self.cat_X = list() if cat_X is None else cat_X               # col idx that are categorical
         self.phi_sum = None
+        self.use = use
+        self.method = 'loop'
         self.max_cnt = 1000
         self.ctr = 0
         self.round = 4
@@ -102,6 +199,10 @@ class ACE(object):
         self.is_fit = False
         self.corr_coef = -1.0
         self.corr_list = list()
+        print('Initial Correlations')
+        for j in range(self.ncols):
+            corr = np.corrcoef(self.X[:, j], self.y[:, 0])[0, 1]
+            print('\tcorr(y, X_' + str(j) + '): ' + str(np.round(corr, 4)))
 
     def fit(self):
         """
@@ -120,6 +221,8 @@ class ACE(object):
             if self.ctr >= self.max_cnt:
                 print('could not converge')
                 break
+        if self.is_fit is True:     # final smooths for prediction
+            self.final_sm_objs = [self.obj_smooth(self.X[:, j], self.phi[:, j], j) for j in range(self.ncols)]
 
     def X_loop(self):
         """
@@ -146,9 +249,9 @@ class ACE(object):
         :return: a smoother object consistent with x (categorical or continuous)
         """
         if j is None:
-            return CatSmooth(x, y) if self.cat_y is True else ContSmooth(x, y)
+            return CatSmooth(x, y) if self.cat_y is True else ContSmooth(x, y, use=self.use, method=self.method)
         else:
-            return CatSmooth(x, y) if j in self.cat_X else ContSmooth(x, y)
+            return CatSmooth(x, y) if j in self.cat_X else ContSmooth(x, y, use=self.use, method=self.method)
 
     def process_col(self, j):
         """
@@ -175,9 +278,8 @@ class ACE(object):
             if self.check_data(X, 'predict data') is False:
                 return None
             Xs = self.x_scaler.transform(X)
-            sm_objs = [self.obj_smooth(self.X[:, j], self.phi[:, j], j) for j in range(self.ncols)]     # list of smoother objects
-            phi_sum = np.sum(np.transpose(np.array([sm_objs[j].predict(Xs[:, j]) for j in range(self.ncols)])), axis=1)
-            s_obj = ContSmooth(self.phi_sum, self.y[:, 0])                                              # phi_sum is always continuous
+            phi_sum = np.sum(np.transpose(np.array([self.final_sm_objs[j].predict(Xs[:, j]) for j in range(self.ncols)])), axis=1)
+            s_obj = ContSmooth(self.phi_sum, self.y_in, use=self.use, method=self.method)                                              # phi_sum is always continuous
             ysm = s_obj.predict(phi_sum)
             return ysm
         else:
@@ -192,22 +294,21 @@ class ACE(object):
         df.columns = ['X_' + str(c) for c in df.columns]
         df['phi_sum'] = self.phi_sum
         df['theta'] = self.theta[:, 0]
-        df['y'] = self.y[:, 0]
+        df['y'] = self.y_in
         yhat = self.predict(self.X_in)
         df['yhat'] = yhat
         gf = pd.DataFrame(self.phi)
         gf.columns = ['phi_' + str(c) for c in gf.columns]
         df = pd.concat([df, gf], axis=1)
 
-        rmse = np.sqrt(np.mean((yhat - self.y[:, 0]) ** 2))
-        df.plot(kind='scatter', grid=True, x='y', y='yhat', title='Prediction\nRMSE: ' + str(np.round(rmse, 4)))
         corr = np.corrcoef(df['phi_sum'].values, df['theta'].values)[0, 1]
+        df.plot(kind='scatter', grid=True, x='phi_sum', y='theta', title='Transformed Prediction\nRMSE: ' + str(np.round(corr, 4)))
         df[['phi_sum', 'theta']].plot(grid=True, style='x-', title='phi_sum and theta transforms\nCorr(theta, phi_sum): ' + str(np.round(corr, 4)))
         corr = np.corrcoef(df['y'].values, df['theta'].values)[0, 1]
         df.plot(kind='scatter', grid=True, x='y', y='theta', style='-x', title='theta transform\nCorr(y, theta): ' + str(np.round(corr, 4)))
         for j in range(self.ncols):
-            corr = np.corrcoef(df['X_' + str(j)].values, df['y'].values)[0, 1]
-            df.plot(kind='scatter', x='X_' + str(j), y='phi_' + str(j), grid=True, title='phi_' + str(j) + ' transform. \nCorr(X_' + str(j) + ', y): ' + str(np.round(corr, 4)))
+            corr = np.corrcoef(df['X_' + str(j)].values, df['phi_' + str(j)].values)[0, 1]
+            df.plot(kind='scatter', x='X_' + str(j), y='phi_' + str(j), grid=True, title='phi_' + str(j) + ' transform. \nCorr(X_' + str(j) + ', phi_' + str(j) + ': ' + str(np.round(corr, 4)))
         return df
 
     @staticmethod
@@ -222,7 +323,8 @@ class ACE(object):
         corr_coef = np.round(np.corrcoef(self.theta[:, 0], self.phi_sum)[0, 1], self.round)
         self.ctr += 1
         if self.verbose:
-            print('ctr: ' + str(self.ctr) + ' prev_corr: ' + str(self.corr_coef) + ' corr: ' + str(corr_coef) + ' eq: ' + str(corr_coef == self.corr_coef) + ' same: ' + str(self.same))
+            print('>>>>> ctr: ' + str(self.ctr) + ' prev_corr: ' + str(self.corr_coef) +
+                  ' corr: ' + str(corr_coef) + ' eq: ' + str(corr_coef == self.corr_coef) + ' same: ' + str(self.same))
         if np.abs(corr_coef - self.corr_coef) == 0.0:
             self.same += 1
             return True if self.same == self.max_same else False
@@ -241,11 +343,11 @@ class ACE(object):
 
 
 class AVAS(ACE):
-    def __init__(self, X, y, cat_X=None, cat_y=False, verbose=True):
+    def __init__(self, X, y, use, cat_X=None, cat_y=False, verbose=True):
         """
         see ACE class
         """
-        super().__init__(X, y, cat_X=cat_X, cat_y=cat_y, verbose=verbose)
+        super().__init__(X, y, cat_X=cat_X, cat_y=cat_y, verbose=verbose, use=use)
 
     def y_loop(self):
         super().y_loop()
@@ -260,7 +362,7 @@ class AVAS(ACE):
         s_y = self.y[args, 0]                               # sorted y
         s_phi_sum = self.phi_sum[args]                      # y sorted phi_sum
         s_lr = lr[args]                                     # y sorted log|residuals|
-        slr_hat = ContSmooth(s_phi_sum, s_lr).predict(s_lr) # phi_sum is always continuous
+        slr_hat = ContSmooth(s_phi_sum, s_lr, use=self.use, method=self.method).predict(s_lr)   # phi_sum is always continuous
         vu = np.exp(slr_hat)[args]                          # y sorted V(u) = Var(theta|phi_sum=u)
         vu = np.where(vu == 0.0, 1.0e-12, vu)               # avoid 1/0
         htheta = np.array([np.trapz(1.0 / np.sqrt(vu[:ix + 1]), s_y[:ix + 1]) for ix in range(self.nrows)])
