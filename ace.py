@@ -189,7 +189,7 @@ class ACE(object):
         self.cat_X = list() if cat_X is None else cat_X               # col idx that are categorical
         self.phi_sum = None
         self.use = use
-        self.method = 'loop'
+        self.method = method
         self.max_cnt = 1000
         self.ctr = 0
         self.round = 4
