@@ -59,6 +59,9 @@ class CatSmooth(object):
         return np.array([self.brr.get(v, 0.0) for v in xarr])
 
 
+SMOOTHER_SWITCH = False
+
+
 class ContSmooth(object):
     """
      continuous smoother
@@ -68,19 +71,20 @@ class ContSmooth(object):
      :param method: (Lowess only) 'loop' or 'bounded'
      :return: E[y|x=a]
      """
-    def __init__(self, x, y, use='SuperSmoother', method='loop', verbose=False):
-        if use == 'SuperSmoother':
+
+    def __init__(self, x, y, use='SuperSmoother', method='loop'):
+        if use == 'SuperSmoother' and SMOOTHER_SWITCH is False:
             self.model = sm.SuperSmoother()
             try:
                 self.model.fit(x, y, dy=np.std(y))
             except ValueError as e:
-                if verbose:
-                    print('WARNING: ' + str(e) + '\nUsing Lowess smoother')
-                self.model = LowessSmooth(x, y, method)
+                print('ERROR: ' + str(e) + '\nTry Lowess smoother')
+                sys.exit(0)
         elif use == 'Lowess':
             self.model = LowessSmooth(x, y, method)
+            self.model.fit()   # get BW
         else:
-            print('ERROR: invalid smoother')
+            print('ERROR: invalid smoother: ' + str(use) + '. Valid smoothers are: SuperSmoother, Lowess')
             sys.exit(-1)
 
     def predict(self, xarr):
@@ -90,20 +94,22 @@ class ContSmooth(object):
 class LowessSmooth(object):
     def __init__(self, x, y, method):
         # method: bounded or loop
-        tic = time.time()
-        frac_list_ = [0.0015625, 0.003125, 0.00625, 0.0125, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
+        frac_list_ = [0.0015625, 0.003125, 0.00625, 0.0125, 0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0]
         self.min_frac = 3 / len(x)  # at least 3 points
-        self.frac_list = [f for f in frac_list_ if f > self.min_frac]
+        self.frac_list = [f for f in frac_list_ if f >= self.min_frac]
         self.args = np.argsort(x)
         self.xs = x[self.args]
         self.ys = y[self.args]
         self.delta = 0.01 * (self.xs[-1] - self.xs[0])
         self.it = 3
-        if method is None:
-            method = 'loop'
-        self.bw, min_mse, niter = self.get_bw(method)
-        print('lowess fit:: method: ' + str(method) +
-              ' time: ' + str(np.round(time.time() - tic, 2)) + 'secs frac: ' + str(np.round(self.bw, 2)) + ' min_mse: ' + str(np.round(min_mse, 4)) + ' niter: ' + str(niter))
+        self.method = 'loop' if method is None else method
+
+    def fit(self):
+        tic = time.time()
+        self.bw, min_mse, niter = self.get_bw(self.method)
+        print('lowess fit:: method: ' + str(self.method) +
+              ' time: ' + str(np.round(time.time() - tic, 2)) +
+              'secs frac: ' + str(np.round(self.bw, 2)) + ' min_mse: ' + str(np.round(min_mse, 4)) + ' niter: ' + str(niter))
 
         # prepare predict for Lowess
         yhat = lowess(self.ys, self.xs, frac=self.bw, is_sorted=True, delta=self.delta, it=self.it)[:, 1]
@@ -122,14 +128,18 @@ class LowessSmooth(object):
         elif method == 'bounded':
             return self._bounded_bw()
         else:
+            print('ERROR: invalid method: ' + str(method) + '. Defaulting to loop')
             return self._loop_bw()
 
     def _loop_bw(self):
         # exit after max_quit_ctr values larger than min_mse
         min_mse, bw, ix = np.inf, 0.5, 0
-        quit_ctr, max_quit_ctr = 0, 1
+        quit_ctr, max_quit_ctr = 0, 2
         for ix, frac in enumerate(self.frac_list):
             mse = self.lowess_cv(frac)
+            # print('>>>>>>>>>>>>>>>>>>> ix: ' + str(ix) + ' frac: ' + str(frac) +
+            #       ' mse: ' + str(np.round(mse, 4)) + ' min_mse: ' + str(np.round(min_mse, 4)) + ' diff: ' + str(np.round(mse - min_mse, 4)) +
+            #       ' quit_ctr: ' + str(quit_ctr))
             if mse < min_mse:
                 quit_ctr = 0  # reset quit_ctr
                 min_mse = mse
@@ -138,7 +148,7 @@ class LowessSmooth(object):
                 quit_ctr += 1
                 if quit_ctr == max_quit_ctr:  # break after we see max_quit_ctr values with mse larger than min_mse
                     break
-        return bw, min_mse, 2 + ix
+        return bw, min_mse, 2 + ix if quit_ctr == max_quit_ctr else self._bounded_bw()  # use bounded if min_mse not found in the grid
 
     def _bounded_bw(self):
         res = minimize_scalar(self.lowess_cv, bracket=None, bounds=(self.min_frac, 0.99), method='bounded', options={'xatol': 1.0e-03, 'maxiter': 500})
@@ -176,29 +186,30 @@ class ACE(object):
             sys.exit(-1)
         if self.check_data(y, 'y') is False:
             sys.exit(-1)
-        self.X_in = X                                                 # self.X shape: (nrows, ncols) (features in columns)
-        self.x_scaler = StandardScaler()
-        self.X = self.x_scaler.fit_transform(X)                       # self.X shape: (nrows, ncols) (features in columns)
-        self.y_in = y                                                              # self.y shape: (nrows, 1)
-        self.y = StandardScaler().fit_transform(np.reshape(y, (-1, 1)))            # self.y shape: (nrows, 1)
-        self.scaler = StandardScaler()
-        self.theta = self.y
-        self.phi = np.zeros_like(self.X)                              # initialize the phi functions
+        self.X_in = X                                                # self.X shape: (nrows, ncols) (features in columns)
+        self.x_scaler = StandardScaler()                             # scaler for X
+        self.X = self.x_scaler.fit_transform(X)                      # self.X shape: (nrows, ncols) (features in columns)
+        self.y_in = y                                                # self.y shape: (nrows, 1)
+        yy = np.reshape(y, (-1, 1))
+        self.y = StandardScaler().fit_transform(yy)                  # self.y shape: (nrows, 1)
+        self.theta = self.y                                          # theta(Y)
+        self.phi = np.zeros_like(self.X)                             # initialize the phi_i functions
         self.nrows, self.ncols = np.shape(self.phi)
-        self.cat_y = cat_y                                            # True/False
-        self.cat_X = list() if cat_X is None else cat_X               # col idx that are categorical
-        self.phi_sum = None
-        self.use = use
-        self.method = method
-        self.max_cnt = 1000
-        self.ctr = 0
-        self.round = 4
-        self.max_same = 3
-        self.same = 0
+        self.cat_y = cat_y                                           # True/False
+        self.cat_X = list() if cat_X is None else cat_X              # col idx that are categorical
+        self.phi_sum = None                                          # sum_i phi_i(X_i)
+        self.use = use                                               # smoother to use
+        self.method = method                                         # BW method for Lowess
+        self.max_cnt = 1000                                          # max ACE/AVAS iterations
+        self.ctr = 0                                                 # iteration counter
+        self.round = 4                                               # convergence identical digits in correlation
+        self.max_same = 3                                            # convergence repeats
+        self.same = 0                                                # convergence correlation repeat counter
         self.verbose = verbose
         self.is_fit = False
         self.corr_coef = -1.0
-        self.corr_list = list()
+        self.corr_list = list()                                      # cyclic convergence list
+        self.max_corr = None
         print('Initial Correlations')
         for j in range(self.ncols):
             corr = np.corrcoef(self.X[:, j], self.y[:, 0])[0, 1]
@@ -208,6 +219,7 @@ class ACE(object):
         """
         finds theta() and phi_i()
         """
+        self.max_corr = None
         while self.is_fit is False:
             self.X_loop()
             self.y_loop()
@@ -221,6 +233,7 @@ class ACE(object):
             if self.ctr >= self.max_cnt:
                 print('could not converge')
                 break
+
         if self.is_fit is True:     # final smooths for prediction
             self.final_sm_objs = [self.obj_smooth(self.X[:, j], self.phi[:, j], j) for j in range(self.ncols)]
 
@@ -325,29 +338,30 @@ class ACE(object):
         if self.verbose:
             print('>>>>> ctr: ' + str(self.ctr) + ' prev_corr: ' + str(self.corr_coef) +
                   ' corr: ' + str(corr_coef) + ' eq: ' + str(corr_coef == self.corr_coef) + ' same: ' + str(self.same))
+
+        # correlation cycle??
+        self.corr_list.append(corr_coef)
+        ucorr = len(set(self.corr_list))
+        if ucorr < len(self.corr_list) / 4:  # correlations are cycling (hopefully with close values)
+            self.max_corr = np.max(np.array(self.corr_list))
+            print('Cyclic correlations::: ' + str(self.ctr) + ' iterations with ' + str(ucorr) + ' unique correlation values and max_corr: ' + str(self.max_corr))
+            return True if self.max_corr == corr_coef else False
+
         if np.abs(corr_coef - self.corr_coef) == 0.0:
             self.same += 1
             return True if self.same == self.max_same else False
         else:
-            self.corr_list.append(corr_coef)
-            if len(self.corr_list) > 3 * self.max_same:
-                self.corr_list.pop(0)
-                if len(set(self.corr_list)) <= self.max_same:  # correlations are cycling (hopefully with close values)
-                    print(list(self.corr_list))
-                    return True
-
-            # no cycles
             self.same = 0
             self.corr_coef = corr_coef
             return False
 
 
 class AVAS(ACE):
-    def __init__(self, X, y, use, cat_X=None, cat_y=False, verbose=True):
+    def __init__(self, X, y, use, method, cat_X=None, cat_y=False, verbose=True):
         """
         see ACE class
         """
-        super().__init__(X, y, cat_X=cat_X, cat_y=cat_y, verbose=verbose, use=use)
+        super().__init__(X, y, use, method, cat_X=cat_X, cat_y=cat_y, verbose=verbose)
 
     def y_loop(self):
         super().y_loop()
