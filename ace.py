@@ -271,7 +271,7 @@ class ACE(object):
         if self.verbose:
             print('>>>>> ctr: ' + str(self.ctr) +
                   ' curr_corr: ' + str(corr_coef) + ' var: ' + str(var) +
-                  ' corrs: ' + str({k: np.round(v, self.round) for k, v in self.var_dict.items() if v > 1}) +
+                  ' vars: ' + str({k: np.round(v, self.round) for k, v in self.var_dict.items() if v > 1}) +
                   ' time: ' + str(np.round(time.time() - self.tic, 4)))
         b = np.max(dict_vals[args]) > self.max_same if len(args) > 0 else False
         return bool(b)  # must have bool here
