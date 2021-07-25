@@ -28,16 +28,16 @@ class CatSmooth(object):
     :return: E[y|x=a]
     """
     def __init__(self, x, y):
-        self.vals = np.unique(x)
         self.brr = dict()
-        for val in self.vals:
+        for val in np.unique(x):
             args = np.argwhere(x == val)[0]
             den = len(args)
-            num = np.sum(y[args])
-            self.brr[self.vals] = num / den
+            self.brr[val] = np.sum(y[args]) / den if den > 0 else 0.0    # E[Y|X=val]
+            self.values = np.array(list(self.brr.keys()))
 
     def predict(self, xarr):
-        return np.array([self.brr.get(v, 0.0) for v in xarr])
+        keys = np.array([self.values[np.argmin(np.abs(self.values - v))] for v in xarr])  # closest key in brr
+        return np.array([self.brr[k] for k in keys])
 
 
 class ContSmooth(object):
@@ -63,11 +63,7 @@ class ContSmooth(object):
                 sys.exit(-1)
             min_span = max(0.05, min_J / len(y))
             self.model = sm.SuperSmoother(primary_spans=(min_span, min_span * s12, min_span * s12 * s23), middle_span=min_span * s12, final_span=min_span)
-            try:
-                self.model.fit(x, y, dy=np.std(y))
-            except ValueError as e:
-                print('ERROR: ' + str(e) + '\nTry Lowess smoother')
-                sys.exit(0)
+            self.model.fit(x, y, dy=np.std(y))
         elif name == 'Lowess':
             self.model = LowessSmooth(x, y)
             self.model.fit(x, y, dy=1.0)   # get BW
