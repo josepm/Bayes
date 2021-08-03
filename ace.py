@@ -6,9 +6,7 @@ X independent variables
 Find theta() and phi_i() that maximize correlation between theta(Y) and sum_{i=1}^p phi_i(X_i) where theta(Y) = sum_{i=1}^p phi_i(X_i)
 
 set use to SuperSmoother or Lowess
-if supersoother fails, switch to lowess
-
-use from my_projects.ace import ace
+if supersoother fails, switch to lowess (but it's slow)
 """
 
 import os
@@ -118,7 +116,7 @@ class ACE(object):
         self.var_dict = dict()                                       # cyclic convergence list
         self.max_corr = None
         self.thres = None
-        self.f_name = 'wrecall'
+        self.f_name = 'wfscore'
 
         # create noisy versions of the data to avoid division by 0
         if self.cat_y is False:
@@ -199,13 +197,27 @@ class ACE(object):
             self.pred_smoother = asm.ContSmooth(self.add_noise(self.phi_sum), self.y_in, self.smoother)
 
         self.thres = None
-        if self.cat_y is True and len(np.unique(self.y_in)) == 2:
-            self.set_thres()
+        if self.cat_y is True:
+            if len(np.unique(self.y_in)) == 2:
+                self.set_thres()
 
     def set_thres(self):
         # sets threshold for classification
+        def f_precision(t):  # maximize recall
+            # precision = (yhat >= t & y_in == 1) / yhat >= t
+            y = np.where(y_hat >= t, 1, 0)
+            num = np.sum(y * y_in)
+            den = np.sum(y)
+            return -(num / den)
+
+        def f_wprecision(t):  # maximize recall
+            y = np.where(y_hat >= t, 1, 0)
+            num = np.sum(y_hat * y * y_in) / np.sum(y_hat)
+            den = np.sum(y)
+            return -(num / den)
+
         def f_recall(t):  # maximize recall
-            # recall = (yhat ==1 & y_in == 1) / yin == 1)
+            # recall = (yhat >= t & y_in == 1) / yin == 1
             y = np.where(y_hat >= t, 1, 0)
             num = np.sum(y * y_in)
             den = np.sum(y_in)
@@ -213,9 +225,19 @@ class ACE(object):
 
         def f_wrecall(t):  # maximize recall
             y = np.where(y_hat >= t, 1, 0)
-            num = np.sum(y_hat * y * y_in) / np.sum(y_in * y)
+            num = np.sum(y_hat * y * y_in) / np.sum(y_hat)
             den = np.sum(y_in)
             return -(num / den)
+
+        def f_fscore(t):
+            pre = f_precision(t)
+            rec = f_recall(t)
+            return (1 + beta ** 2) * pre * rec / ((beta ** 2) * pre + rec)
+
+        def f_wfscore(t):
+            pre = f_wprecision(t)
+            rec = f_wrecall(t)
+            return (1 + beta ** 2) * pre * rec / ((beta ** 2) * pre + rec)
 
         def f_rmse(t):  # rmse
             y = np.where(y_hat >= t, 1, 0)
@@ -223,10 +245,22 @@ class ACE(object):
 
         y_hat = self.predict(self.X_in)
         y_in = self.y_in
+        y_hat = y_hat[~np.isnan(y_hat)]  # used in func
+        y_in = y_in[~np.isnan(y_hat)]  # used in func
         if self.f_name == 'recall':
             func = f_recall
         elif self.f_name == 'wrecall':
             func = f_wrecall
+        elif self.f_name == 'precision':
+            func = f_precision
+        elif self.f_name == 'wprecision':
+            func = f_wprecision
+        elif self.f_name == 'f_fscore':
+            beta = 1.0
+            func = f_fscore
+        elif self.f_name == 'f_wfscore':
+            beta = 1.0
+            func = f_wfscore
         else:
             func = f_rmse
         res = minimize_scalar(func, bounds=(0.0, 1.0), method='bounded')
@@ -390,7 +424,7 @@ class ACE(object):
         df.plot(kind='scatter', grid=True, x='y', y='theta', style='-x', title='theta transform\nCorr(y, theta): ' + str(np.round(corr, 4)))
         for j in range(self.ncols):
             corr = np.corrcoef(df['X_' + str(j)].values, df['phi_' + str(j)].values)[0, 1]
-            df.plot(kind='scatter', x='X_' + str(j), y='phi_' + str(j), grid=True, title='phi_' + str(j) + ' transform. \nCorr(X_' + str(j) + ', phi_' + str(j) + ': ' + str(np.round(corr, 4)))
+            df.plot(kind='scatter', x='X_' + str(j), y='phi_' + str(j), grid=True, title='phi_' + str(j) + ' transform. \nCorr(X_' + str(j) + ', phi_' + str(j) + '): ' + str(np.round(corr, 4)))
 
     @staticmethod
     def check_data(arr, lbl):
